@@ -1,0 +1,86 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Lambda Function to receive Autosacling Launch event and send SNS with instance private IP
+Parameters:
+  Tenant:
+    Type: String
+    Default: rbit
+  Environment:
+    Type: String
+    Default: test
+  RecipientMailAddress:
+    Type: String
+    Default: work.neelima7@gmail.com
+    
+Resources:
+  ServerlessFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: Recieve Autoscaling Group notification and send SNS with Instance Private IP
+      FunctionName: !Sub ${Tenant}-${Environment}-autoscaling-notify-sns
+      Runtime: python3.8
+      CodeUri: ./lambda/sns.py
+      Handler: sns.handler
+      Events:
+          NotificationTopic:     
+              Type: SNS
+              Properties: 
+                  Topic: !Ref ASGSNSTopic
+      Policies:
+      - AWSLambdaExecute
+      - Version: '2012-10-17'
+        Statement:
+          - Sid: ec2
+            Effect: Allow
+            Action:
+              - ec2:DescribeInstances
+            Resource: '*'
+          - Sid: sns
+            Effect: Allow
+            Action:
+              - sns:Publish
+            Resource: !Ref NewInstanceSNSTopic
+      Tags:
+        Tenant: !Ref Tenant
+        Environment: !Ref Environment
+      Environment:
+        Variables:
+          TOPIC_ARN: !Ref NewInstanceSNSTopic
+
+  ASGSNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: LambdaSubscription
+      Tags:
+      - Key: Tenant
+        Value: !Ref Tenant
+      - Key: Environment
+        Value: !Ref Environment
+
+  NewInstanceSNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: NewInstance
+      Subscription:
+      - Endpoint: !Ref RecipientMailAddress
+        Protocol: email
+      Tags:
+      - Key: Tenant
+        Value: !Ref Tenant
+      - Key: Environment
+        Value: !Ref Environment
+
+  SNSTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Sid: sns
+          Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action: sns:Publish
+          Resource: !Ref NewInstanceSNSTopic
+      Topics:
+      - !Ref NewInstanceSNSTopic

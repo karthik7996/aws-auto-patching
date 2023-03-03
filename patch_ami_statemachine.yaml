@@ -1,0 +1,780 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Create AMI with the latest patches installed and update LaunchConfiguration
+  and Autoscaling group
+Parameters:
+  RecipientMailAddress:
+    Type: String
+    Default: sreekanth.reddy@cloudzenix.com
+  Tenancy:
+    Description: Tenant
+    Type: String
+    Default: test
+    AllowedPattern: '[/a-z0-9\-\.]*'
+  Environment:
+    Description: Environment value
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /cz/env
+  LogBucketName:
+    Description: SSM Log Bucket Name
+    Type: String
+    Default: ami-patch-logs
+  PatchvpcBlock:
+    Description: " The CIDR range used by the Patchvpc."
+    Type: String
+    Default: 10.0.0.0/16
+  AZforPublicSubnet:
+    Description: Availability Zones to use for the forPatch-Subnet in the VPC
+    Type: String
+    Default: ap-southeast-2a
+  CIDRforPublicSubnet:
+    Description: CIDR Block for Patch-Subnet (X.X.X.X/X)
+    Type: String
+    Default: 10.0.128.0/20
+  AZforPrivateSubnet:
+    Description: Availability Zones to use for the forPatch-Subnet in the VPC
+    Type: String
+    Default: ap-southeast-2c
+  CIDRforPrivateSubnet:
+    Description: CIDR Block for Patch-Subnet (X.X.X.X/X)
+    Type: String
+    Default: 10.0.0.0/20
+Resources:
+  Patchvpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock:
+        Ref: PatchvpcBlock
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      InstanceTenancy: default
+      Tags:
+      - Key: Name
+        Value: Patchvpc
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+      - Key: Name
+        Value: PatchIGW
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId:
+        Ref: Patchvpc
+      InternetGatewayId:
+        Ref: InternetGateway
+  IGWRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId:
+        Ref: Patchpublicroutetable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId:
+        Ref: InternetGateway
+  Patchpublicroutetable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      Tags:
+      - Key: Name
+        Value: PatchRoutetable
+      VpcId:
+        Ref: Patchvpc
+  Patchprivateroutetable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      Tags:
+      - Key: Name
+        Value: PatchRoutetable
+      VpcId:
+        Ref: Patchvpc
+  PatchpublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone:
+        Ref: AZforPublicSubnet
+      CidrBlock:
+        Ref: CIDRforPublicSubnet
+      VpcId:
+        Ref: Patchvpc
+      Tags:
+      - Key: Name
+        Value: Patch-Subnet
+  PatchprivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone:
+        Ref: AZforPrivateSubnet
+      CidrBlock:
+        Ref: CIDRforPrivateSubnet
+      VpcId:
+        Ref: Patchvpc
+      Tags:
+      - Key: Name
+        Value: Patch-Subnet
+  PatchpublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId:
+        Ref: PatchpublicSubnet
+      RouteTableId:
+        Ref: Patchpublicroutetable
+  PatchprivateSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId:
+        Ref: PatchprivateSubnet
+      RouteTableId:
+        Ref: Patchprivateroutetable
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId:
+        Fn::GetAtt:
+        - NatGatewayEIP
+        - AllocationId
+      SubnetId:
+        Ref: PatchpublicSubnet
+      Tags:
+      - Key: Name
+        Value: NatGW
+  NatGatewayEIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+  RouteNATGateway:
+    DependsOn:
+    - NatGateway
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId:
+        Ref: Patchprivateroutetable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId:
+        Ref: NatGateway
+
+
+  PatchingSecuritygroup1:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: 'Allow only outbound '
+      GroupName: Patch-SG
+      SecurityGroupEgress:
+      - IpProtocol: tcp
+        FromPort: 80
+        ToPort: 80
+        CidrIp: 0.0.0.0/0
+      - IpProtocol: tcp
+        FromPort: 443
+        ToPort: 443
+        CidrIp: 0.0.0.0/0
+      Tags:
+      - Key: Name
+        Value: Patch-SG1
+      VpcId:
+        Ref: Patchvpc
+  PatchEc2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: EC2patchrole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - ec2.amazonaws.com
+          Action: sts:AssumeRole
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+      - PolicyName: ssm
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Action:
+            - ssm:CreateAssociation
+            Effect: Allow
+            Resource: '*'
+      Path: /service-role/
+  PatchEc2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+      - Ref: PatchEc2Role
+  AutomationServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - ssm.amazonaws.com
+          Action: sts:AssumeRole
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/service-role/AmazonSSMAutomationRole
+      Policies:
+        - PolicyName: ssm_service_policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Action:
+                  - iam:PassRole
+                  - ec2:RunInstance
+                  - kms:RetireGrant
+                  - kms:CreateGrant
+                  - kms:ReEncrypt*
+                  - kms:GenerateDataKey*
+                  - kms:Encrypt
+                  - kms:DescribeKey
+                  - kms:Decrypt
+                Effect: Allow
+                Resource: '*'      
+      Path: /service-role/
+
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+              - ec2.amazonaws.com
+          Action: sts:AssumeRole      
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: ssm
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Action:
+                  - ssm:CreateAssociation
+                Effect: Allow
+                Resource: '*'
+        - PolicyName: Allow_Create_Tag
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Action:
+                  - ec2:DescribeInstances
+                  - ec2:CreateTags
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                  - logs:PutLogEvents
+                Effect: Allow
+                Resource: '*'
+              - Action:
+                  - s3:PutObject
+                Effect: Allow
+                Resource: !Sub arn:aws:s3:::${LogBucketName}/*
+      Path: /service-role/
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref EC2Role
+
+  SsmLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: 
+      LogGroupName: SSMPatchLogGroup
+      RetentionInDays: 30
+
+  PatchAMI:
+    Type: AWS::SSM::Document
+    Properties: 
+      DocumentType: Automation
+      Content:
+        description: SSM Automation Patch AMI and Update ASG
+        schemaVersion: '0.3'
+        assumeRole: !Sub ${AutomationServiceRole.Arn}   
+        parameters:
+          sourceAMIid:
+            type: String
+            description: The ID of the AMI you want to patch
+          targetASG:
+            type: String
+            description: Auto Scaling group to Update
+
+        mainSteps:
+          - name: startInstances
+            action: aws:runInstances
+            timeoutSeconds: 1200
+            maxAttempts: 1
+            onFailure: Abort
+            inputs:
+              ImageId:  '{{ sourceAMIid }}' 
+              InstanceType: m4.xlarge
+              MinInstanceCount: 1
+              MaxInstanceCount: 1
+              IamInstanceProfileName:  !Ref EC2InstanceProfile
+              SubnetId: !Ref PatchprivateSubnet 
+              SecurityGroupIds: [{ Fn::GetAtt : [ PatchingSecuritygroup1, GroupId] }]
+          - name: runPatchBaseline
+            action: aws:runCommand
+            maxAttempts: 1
+            onFailure: Abort
+            inputs:
+              DocumentName: AWS-RunPatchBaseline
+              TimeoutSeconds: 3600
+              OutputS3BucketName: !Ref LogBucketName
+              OutputS3KeyPrefix: patch-install
+              InstanceIds:
+                - '{{ startInstances.InstanceIds }}'
+              Parameters:
+                Operation: Install
+              CloudWatchOutputConfig:
+                CloudWatchLogGroupName: !Ref SsmLogGroup
+                CloudWatchOutputEnabled: true
+              
+          - name: stopInstance
+            action: aws:changeInstanceState
+            maxAttempts: 1
+            onFailure: Continue
+            inputs:
+              InstanceIds:
+                - '{{ startInstances.InstanceIds }}'
+              DesiredState: stopped
+          - name: createImage
+            action: aws:createImage
+            maxAttempts: 1
+            onFailure: Abort
+            inputs:
+              InstanceId: '{{ startInstances.InstanceIds }}'
+              ImageName: 'AMI Backup of {{ startInstances.InstanceIds }} taken at {{global:DATE_TIME}}'
+              NoReboot: true
+              ImageDescription: AMI created by EC2 Automation
+          - name: terminateInstance
+            action: aws:changeInstanceState
+            maxAttempts: 1
+            onFailure: Continue
+            inputs:
+              InstanceIds:
+                - '{{ startInstances.InstanceIds }}'
+              DesiredState: terminated
+        outputs:
+          - createImage.ImageId
+
+  UpdateAsgFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: update_asg.lambda_handler
+      FunctionName: !Sub ${Tenancy}-${Environment}-update-asg
+      Runtime: python3.8
+      Timeout: 180
+      CodeUri: ./Lambda/update_asg.py
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: 
+                - ec2:DescribeInstances
+                - ec2:DescribeImages
+                - ec2:DeleteTags
+                - ec2:CreateTags
+                - ec2:StopInstances
+                - autoscaling:CreateLaunchConfiguration
+                - autoscaling:DeleteLaunchConfiguration
+                - autoscaling:UpdateAutoScalingGroup
+                - autoscaling:DescribeAutoScalingGroups
+                - autoscaling:DescribeLaunchConfigurations
+              Resource: '*'
+      Tags:
+        Name: update-asg
+        Tenant: !Ref Tenancy
+        Environment: !Ref Environment
+  InstanceRefreshFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: instance_refresh.lambda_handler
+      FunctionName: !Sub ${Tenancy}-${Environment}-instance-refresh
+      Runtime: python3.8
+      Timeout: 180
+      CodeUri: ./Lambda/instance_refresh.py
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: 
+                - ec2:DescribeInstances
+                - ec2:DescribeImages
+                - ec2:DescribeLaunchTemplates
+                - ec2:RunInstances
+                - ec2:CreateTags
+                - ec2:StopInstances
+                - autoscaling:Describe*
+                - autoscaling:StartInstanceRefresh
+                - autoscaling:UpdateAutoScalingGroup
+                - autoscaling:DescribeAutoScalingGroups
+                - autoscaling:DescribeLaunchConfigurations
+              Resource: '*'
+      Tags:
+        Name: instance_refresh
+        Tenant: !Ref Tenancy
+        Environment: !Ref Environment
+        
+  UpdateLcFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: update_lc.lambda_handler
+      FunctionName: !Sub ${Tenancy}-${Environment}-update-lc
+      Runtime: python3.8
+      Timeout: 10
+      CodeUri: ./Lambda/update_lc.py
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: 
+                - autoscaling:DeleteLaunchConfiguration
+                - autoscaling:UpdateAutoScalingGroup
+                - autoscaling:DescribeAutoScalingGroups
+                - autoscaling:DescribeLaunchConfigurations
+              Resource: '*'
+      Tags:
+        Name: update-lc
+        Tenant: !Ref Tenancy
+        Environment: !Ref Environment
+
+  StartAutomationFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: start_automation.lambda_handler
+      FunctionName: !Sub ${Tenancy}-${Environment}-start-automation
+      Runtime: python3.8
+      Timeout: 10
+      CodeUri: ./Lambda/start_automation.py
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: 
+                - ssm:StartAutomationExecution
+              Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:automation-definition/${PatchAMI}:*'
+      Environment:
+        Variables:
+          DOC_NAME: !Ref PatchAMI
+      Tags:
+        Name: start-automation
+        Tenant: !Ref Tenancy
+        Environment: !Ref Environment
+
+  StartStatemachineFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: start_statemachine.lambda_handler
+      FunctionName: !Sub ${Tenancy}-${Environment}-start-statemachine
+      Runtime: python3.8
+      Timeout: 10
+      CodeUri: ./Lambda/start_statemachine.py
+      Environment:
+        Variables:
+          STATE_MACHINE_ARN: !Ref PatchAMIStepFunction
+          SUBNET_ID: !Ref PatchpublicSubnet
+      Events:
+        CloudWatchCronSchedule:
+          Type: Schedule
+          Properties:
+            Description: Start Patch Prod Servers
+            Name: !Sub ${Tenancy}-${Environment}-start-patch-automation
+            Schedule: cron(0 17 ? * SAT *)
+            Enabled: True
+      Tags:
+        Name: start-statemachine
+        Tenant: !Ref Tenancy
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - states:StartExecution
+              Resource: !Ref PatchAMIStepFunction
+            - Effect: Allow
+              Action:
+                - autoscaling:DescribeAutoScalingGroups
+                - autoscaling:DescribeLaunchConfigurations
+              Resource: '*'
+
+  CheckAutomationFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: check_automation.lambda_handler
+      FunctionName: !Sub ${Tenancy}-${Environment}-check-automation
+      Runtime: python3.8
+      Timeout: 10
+      CodeUri: ./Lambda/check_automation.py
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: 
+                - ssm:DescribeAutomationExecutions
+              Resource: '*'
+      Tags:
+        Name: check-automation
+        Tenancy: !Ref Tenancy
+        Environment: !Ref Environment
+
+  CheckInstanceStateFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: check_instance_state.lambda_handler
+      FunctionName: !Sub ${Tenancy}-${Environment}-check-instance-state
+      Runtime: python3.8
+      Timeout: 10
+      CodeUri: ./Lambda/check_instance_state.py
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: 
+                - autoscaling:DescribeAutoScalingGroups
+              Resource: '*'
+      Tags:
+        Name: check-automation
+        Tenancy: !Ref Tenancy
+        Environment: !Ref Environment
+
+  PatchAMIStepFunction:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: Patch-AMI-StateMachine
+      Role: !Sub ${StatesExecutionRole.Arn}
+      Logging:
+        Level: ERROR
+        Destinations: 
+          - CloudWatchLogsLogGroup: 
+              LogGroupArn: !Sub ${StateMachineLog.Arn}
+        IncludeExecutionData: True
+      Definition:
+        Comment: Install patches and create new AMI
+        StartAt: StartAutomation
+        States:
+          StartAutomation:
+            Type: Task
+            ResultPath: $.AutomationId
+            Resource: !Sub ${StartAutomationFunction.Arn}
+            TimeoutSeconds: 10
+            Retry:
+              - ErrorEquals:
+                  - Lambda.ServiceException
+                  - States.Timeout
+                IntervalSeconds: 0
+                MaxAttempts: 3
+            Next: AutomationWait
+          AutomationWait:
+            Type: Wait
+            Seconds: 120
+            Next: CheckAutomationStatus
+          CheckAutomationStatus:
+            Type: Task
+            ResultPath: $.AutomationStatus
+            Resource: !Sub ${CheckAutomationFunction.Arn}
+            TimeoutSeconds: 10
+            Retry:
+              - ErrorEquals:
+                  - Lambda.ServiceException
+                  - States.Timeout
+                IntervalSeconds: 0
+                MaxAttempts: 3
+            Next: IsJobCompleted
+          IsJobCompleted:
+            Type: Choice
+            Choices:
+              - Variable: $.AutomationStatus.status
+                StringEquals: Success
+                Next: ReplaceInstance
+              - Variable: $.AutomationStatus.status
+                StringEquals: Failed
+                Next: NotifyError
+            Default: AutomationWait
+          ReplaceInstance:
+            Type: Task
+            ResultPath: $.LaunchConfig
+            Resource: !Sub ${UpdateAsgFunction.Arn}
+            TimeoutSeconds: 10
+            Retry:
+              - ErrorEquals:
+                  - Lambda.ServiceException
+                  - States.Timeout
+                IntervalSeconds: 0
+                MaxAttempts: 3
+            Next: InstanceWait
+          CheckInstance:
+            Type: Task
+            ResultPath: $.Instance
+            Resource: !Sub ${CheckInstanceStateFunction.Arn}
+            TimeoutSeconds: 10
+            Retry:
+              - ErrorEquals:
+                  - Lambda.ServiceException
+                  - States.Timeout
+                IntervalSeconds: 0
+                MaxAttempts: 3
+            Next: IsInstanceInService
+          IsInstanceInService:
+            Type: Choice
+            Choices:
+              - Variable: $.Instance.status
+                StringEquals: InService
+                Next: CleanUpLC
+              - Variable: $.Instance.status
+                StringEquals: Failed
+                Next: RollbackLC
+              - Variable: $.LaunchConfig
+                StringEquals: 'No instance in the autoscaling group'
+                Next: NotifyError
+            Default: InstanceWait
+          InstanceWait:
+            Type: Wait
+            Seconds: 60
+            Next: CheckInstance
+          CleanUpLC:
+            Type: Task
+            ResultPath: $.UpdateLC
+            Resource: !Sub ${UpdateLcFunction.Arn}
+            TimeoutSeconds: 10
+            Retry:
+              - ErrorEquals:
+                  - Lambda.ServiceException
+                  - States.Timeout
+                IntervalSeconds: 0
+                MaxAttempts: 3
+            Next: RefreshWait
+          RefreshWait:
+            Type: Wait
+            Seconds: 120
+            Next: InstanceRefresh
+          InstanceRefresh:
+            Type: Task
+            ResultPath: $.InstanceRefresh
+            Resource: !Sub ${InstanceRefreshFunction.Arn}
+            TimeoutSeconds: 10
+            Retry:
+              - ErrorEquals:
+                  - Lambda.ServiceException
+                  - States.Timeout
+                IntervalSeconds: 0
+                MaxAttempts: 3
+            Next: PatchAMICompleted
+          RollbackLC:
+            Type: Task
+            ResultPath: $.UpdateLC
+            Resource: !Sub ${UpdateLcFunction.Arn}
+            TimeoutSeconds: 10
+            Retry:
+              - ErrorEquals:
+                  - Lambda.ServiceException
+                  - States.Timeout
+                IntervalSeconds: 0
+                MaxAttempts: 3
+            Next: NotifyError
+          NotifyError:
+            Type: Task
+            Resource: arn:aws:states:::sns:publish
+            Parameters:
+              TopicArn: !Sub ${StepFunctionErrorTopic}
+              Subject: 'PatchAMI Automation Failed!'
+              Message.$: $
+            Next: PatchAMIFailed
+          PatchAMIFailed:
+            Type: Fail
+            Cause: Failed to Patch AMI
+            Error: PatchAMIError
+          PatchAMICompleted:
+            Type: Pass
+            End: true
+      Tags:
+        Name: patch-ami-statemachine
+        Tenancy: !Ref Tenancy
+        Environment: !Ref Environment
+
+  StateMachineLog:
+    Type: AWS::Logs::LogGroup
+    Properties: 
+      LogGroupName: /aws/states/patch-ami
+      RetentionInDays: 90
+
+  StatesExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - !Sub states.${AWS::Region}.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /service-role/
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchFullAccess
+      Policies:
+        - PolicyName: StatesExecutionPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: 
+                 - !Sub ${StartAutomationFunction.Arn}
+                 - !Sub ${CheckAutomationFunction.Arn}
+                 - !Sub ${UpdateAsgFunction.Arn}
+                 - !Sub ${UpdateLcFunction.Arn}
+                 - !Sub ${CheckInstanceStateFunction.Arn}
+                 - !Sub ${InstanceRefreshFunction.Arn}
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref StepFunctionErrorTopic
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogGroups
+                  - logs:CreateLogDelivery
+                  - logs:GetLogDelivery
+                Resource: '*'
+
+  StepFunctionErrorTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: PatcheAMIFailed
+  SubscriptionName:
+    Type: 'AWS::SNS::Subscription'
+    Properties:
+      Protocol: email
+      Endpoint: !Ref RecipientMailAddress
+      TopicArn: !Ref StepFunctionErrorTopic
+  Topicpolicy:
+    Type: 'AWS::SNS::TopicPolicy'
+    Properties:
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Sid: sns
+            Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action: 'sns:Publish'
+            Resource: !Ref StepFunctionErrorTopic
+      Topics:
+        - !Ref StepFunctionErrorTopic
